@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Environments
+.venv/
+venv/
+.env
+
+# OS / editor
+.DS_Store
+
+# Large data (kept local, not versioned)
+combined_BEAM_with_inSilicoNegatives_w_HIV_CMV_HPV.csv
+*.csv

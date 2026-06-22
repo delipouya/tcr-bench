@@ -1,0 +1,133 @@
+
+--------------------------------------------------------------------
+### Train/Test/Validation Splits
+
+Train is what the model fits its parameters on. 
+Validation is what you use to make decisions about the model — hyperparameters, feature sets, early stopping, which architecture to keep. 
+Test is touched once, at the very end, to estimate generalization.
+The key idea is that the moment you use a set to choose something, you've leaked information into your choice, and that set can no longer give an unbiased performance estimate. 
+The val set absorbs that contamination so the test set stays clean.
+
+The split must respect the dependency structure of the data, not just be random over rows. 
+A random split leaks whenever rows share latent structure — which for you is constant. If the same TCR clonotype, the same donor, or the same peptide appears in both train and test, you're measuring memorization of that entity rather than generalization to new ones. 
+That's why grouped splits (leave-one-donor-out, peptide-grouped CV) are the honest thing and a random split inflates AUC. The "unit of generalization" you claim in the paper has to be the unit you split on.
+
+-------------------------------------
+-- TCR axis -- new patient question --
+--------------------------------------
+- Donor split (leave-one-donor-out)
+Pro: removes person-level confounds that aren't in the sequence — HLA background, germline/VJ usage, clonal structure, and sequencing/wet-lab batch.
+Pro: matches real deployment ("a new patient walks in") — the person is the unit you generalize over.
+Con: misses cross-person sequence leakage — public/convergent TCRs (same CDR3 in a train donor and the test donor) slip straight through → optimistic.
+Con: no control over near-twin TCRs by itself.
+Answers: "Does it generalize to a new person?"
+
+- TCR-similarity clustering (cluster by tcrdist/CD-HIT, keep each cluster in one fold)
+
+Pro: stops near-identical/public TCRs from straddling the split, regardless of which donor they came from.
+Pro: kills the "memorize a CDR3 motif in training, re-recognize it in test" inflation.
+Con: blind to person-level confounds — the same donor's HLA/batch can still sit on both sides if their TCRs fall in different clusters.
+Con: on its own doesn't match a "new patient" deployment unit.
+Answers: "Does it generalize to TCRs unlike those seen in training?"
+
+donor controls who it came from, clustering controls what it looks like. 
+Use the donor split as the partition, then drop from training any TCR whose cluster appears in the held-out donor. That closes both holes.
+
+-------------------------------------------
+--  peptide axis - the pan-peptide question
+--------------------------------------------
+
+- Leave-one-peptide-out (exact epitope grouping) — the basic pan-peptide split
+Pro: directly tests the generalization you'd need for de-orphanisation / a new antigen — the honest hard number.
+Pro: matches the "new antigen arrives" deployment, and the per-peptide breakdown shows which panel peptides are learnable.
+Con: genuinely novel peptides are near-random (field consensus) — expect low, not high.
+Con: a held-out peptide that's one mutation from a training peptide isn't really "unseen" → optimistic unless you also control distance.
+Con: few distinct peptides → high variance and unstable per-peptide metrics; need a minimum-positives floor.
+Answers: "Does it generalize to a new peptide?"
+
+
+- Peptide-similarity / distance control (cluster near-identical peptides; report distance-to-nearest-train)
+Pro: stops "fake novelty" — near-twin peptides leaking across the split, which is what silently inflated exact leave-one-peptide-out.
+Pro: lets you report performance as a curve vs distance to the nearest training peptide (the genuinely informative output, à la TCRcube Fig 3) — separates true OOD from "basically peptide-specific."
+Con: MHC-I peptides are 8–11mers, so identity/similarity thresholds are arbitrary and noisy (no clean homology clustering like full-protein antigens).
+Con: aggressive distance control shrinks already-scarce peptide data fast.
+Con: doesn't raise the ceiling — it measures the near-random reality honestly rather than fixing it.
+Answers: "How far from training can the peptide be before performance collapses?"
+
+
+
+--------------------------------------------
+------      Pseudo-code version    -------
+--------------------------------------------
+
+PREP  (do once, before any split):
+    if using TCRdock / structural features:
+        drop any pair whose complex is already in the PDB      # AlphaFold may have memorised it
+    collapse to one row per (TCR clonotype, peptide)           # so big expanded clones don't dominate or leak
+    give every TCR a cluster id by grouping look-alike TCRs    # tcrdist / CD-HIT; near-twins share an id
+    measure each peptide's similarity to the others            # so we can catch near-twin peptides later
+    # note: every pair carries its own donor and peptide, so the true negatives
+    #       automatically follow whatever a split hides.
+
+
+SPLIT 1  (new patient, known antigens)   <-- your headline result:
+    for each person:
+        test  = all pairs from this person
+        val   = all pairs from one other person
+        train = all pairs from everyone else
+        drop from train any TCR whose cluster shows up in test    # close the public-TCR hole
+    -> peptides appear on both sides; only the PERSON is hidden
+    -> tests: "does it generalise to a new person?"
+
+
+SPLIT 2  (new antigen)   <-- pan-peptide / de-orphanisation, expect it to be hard:
+    for each peptide:
+        test  = all pairs with this peptide
+        val   = all pairs with one other peptide
+        train = all pairs with the remaining peptides
+        drop from train any peptide that is a near-twin of the test peptide   # no fake novelty
+        record the test peptide's distance to its nearest training peptide    # for the distance curve
+    -> TCRs may repeat; only the PEPTIDE is hidden
+    -> MUST also score the TCR-only baseline here, or you can't tell real
+       peptide-generalisation from TCR memorisation
+    -> tests: "does it generalise to a new peptide, and how far before it breaks?"
+
+
+SPLIT 3  (new patient AND new antigen)   <-- conservative floor:
+    pick a few people to hide and a few peptides to hide
+    test  = pairs where the person is hidden AND the peptide is hidden
+    train = pairs where the person is seen   AND the peptide is seen
+    throw away everything else                                   # the cost of a clean split
+    drop from train any TCR whose cluster shows up in test        # no TCR twins
+    drop from train any peptide that is a near-twin of a test peptide   # no peptide twins
+    -> both axes hidden at once
+    -> tests: "does it generalise to a new patient AND a new antigen?"
+
+
+EVALUATE  (same for all three splits):
+    keep the real binder : non-binder ratio        # do NOT balance the test set
+    report AUPRC and precision-in-the-top-N         # not just AUROC, which flatters when binders are rare
+    break results down per peptide                  # skip peptides with too few positives to be stable
+    also score two dumb baselines on the same test:
+        - V/J genes only
+        - TCR only (ignore the peptide)
+    your model must beat both, or it isn't really learning binding
+
+
+---------------------------------------------------
+------     What did TCRcube control for?  ----------
+---------------------------------------------------
+Leave-one-peptide-out:
+YES (its core contribution). The pan-peptide split is epitope-disjoint — 62 test epitopes never appear among the 732 training epitopes. 
+This is the main thing TCRcube does, plus PDB exclusion to block AF2-training leakage. This is your Split 2.
+
+Peptide-distance control:
+MEASURED, not enforced. They compute the minimal Levenshtein distance between each test epitope and the nearest training epitope, 
+but they use it as a post-hoc analysis (Fig 3 — stratify test by distance, remove near/far epitopes) rather than baking it into the split. 
+The main pan-peptide split does not remove near-twin peptides from training. So they have the distance axis as a measurement layer, not as a split discipline.
+
+Donor split:
+NO. The public data is aggregated from VDJdb/McPAS/IEDB/10x with no person-level structure, so there's no donor to hold out. Not implemented.
+TCR clustering → NO. In the pan-peptide split, TCRs recur freely with no clustering. In the peptide-specific (IMMREP) split they hold out exact TCRs 
+(test TCRs differ from train TCRs) but never cluster, so near-twin/public TCRs can straddle. 
+The motif analysis (Fig 4) is essentially the evidence that this is happening — recurring CDR3 motifs drive the peptide-specific performance, which is exactly the near-neighbour leakage TCR clustering would catch.
