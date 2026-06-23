@@ -1,0 +1,12 @@
+pandas
+numpy
+scipy
+scikit-learn
+matplotlib
+seaborn
+python-Levenshtein
+requests
+jupyter
+ipykernel
+nbconvert
+biopython
